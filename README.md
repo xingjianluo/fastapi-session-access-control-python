@@ -7,17 +7,71 @@
 ## 架构
 
 ```
-main.py               应用工厂 create_app()，注册异常处理器与路由
+main.py               应用工厂 create_app()，注册追踪中间件、异常处理器与路由
+app/config.py         运行参数配置（环境变量 -> Settings，缺省回退默认值）
 app/errors.py         RejectionReason 枚举 + AccessDeniedError（统一异常链路）
 app/models.py         Session / Resource / AuthzDecision 数据模型
 app/session_store.py  进程内会话仓库（签发、校验、轮换、撤销，线程安全）
 app/authz.py          默认拒绝授权器（作用域 + 归属双条件）
 app/rate_limit.py     按来源失败计数、限流与临时锁定（线程安全）
-app/routes.py         HTTP 路由，把上述能力接入请求处理与异常链路
+app/audit.py          本地审计日志（容量上限、FIFO 淘汰、筛选分页，线程安全）
+app/tracing.py        请求追踪标识（contextvar 传递）
+app/routes.py         HTTP 路由 + 只读运维端点，把上述能力接入请求处理与异常链路
 ```
 
 所有拒绝都通过 `AccessDeniedError` 进入 FastAPI 异常处理器，响应结构统一为
-`{"error": <reason>, "detail": <说明>}`，`error` 取值即可区分的拒绝原因。
+`{"error": <reason>, "detail": <说明>, "trace_id": <追踪标识>}`，`error` 取值即可区分的拒绝原因。
+
+## 请求追踪
+
+- 每个请求都有稳定的追踪标识：所有响应（成功/拒绝/异常）都带 `X-Trace-Id`
+  响应头；错误响应体中同时含 `trace_id` 字段，与响应头一致。
+- 调用方可通过请求头 `X-Trace-Id` 传入自己的标识（非空即被沿用），否则服务端
+  自动生成。
+- 未预期异常统一返回 `500 {"error": "internal_error", "detail": "服务内部错误",
+  "trace_id": ...}`，不暴露堆栈与内部细节；堆栈只写入服务端日志，并挂在同一个
+  `trace_id` 下，可按标识关联查询。
+- 每条审计记录都带 `trace_id`，可用响应中的标识在 `/ops/audit` 里查到同一次判定。
+
+## 本地审计查询
+
+每一次访问判定（签发/轮换/撤销/资源访问，无论放行或拒绝）都会写入进程内审计
+日志，记录：序号 `seq`、追踪标识、时间戳、来源、主体、动作、目标资源、判定结果
+与依据说明。
+
+```
+GET /ops/audit?since=<ts>&until=<ts>&subject=<主体>&outcome=<结果>&offset=0&limit=50
+```
+
+- 全部筛选参数可选；`since`/`until` 为 Unix 时间戳（闭区间），`subject`/`outcome`
+  精确匹配；`offset`/`limit` 分页（`limit` 上限 500），响应含 `total` 便于翻页。
+- 写入在锁内完成：并发下不丢、不重，`seq` 单调递增且与写入顺序一致，结果按
+  `seq` 升序返回。
+- 容量上限 `audit_capacity`（默认 10000），满时 FIFO 淘汰最旧记录；淘汰只影响
+  审计数据本身，不影响会话、失败计数或锁定状态。
+
+## 运行状态观测
+
+```
+GET /ops/status?source=<来源IP>
+```
+
+只读返回：指定来源的锁定状态与恢复时刻（`locked`/`locked_until`，不传 `source`
+则省略）、当前有效会话数（未撤销/未轮换/未过期）、审计存储占用
+（`capacity`/`size`/`evicted`/`next_seq`）。不返回任何凭据内容。
+
+## 运行参数配置
+
+以下参数可通过环境变量配置，未配置（或值为空/非法）时保持既有默认行为：
+
+| 环境变量 | 含义 | 默认值 |
+| --- | --- | --- |
+| `SESSION_TTL_SECONDS` | 会话有效期（秒） | `3600` |
+| `RATE_LIMIT_MAX_FAILURES` | 连续失败锁定阈值 | `5` |
+| `RATE_LIMIT_LOCKOUT_SECONDS` | 锁定时长（秒） | `30` |
+| `AUDIT_CAPACITY` | 审计记录容量上限 | `10000` |
+
+`create_app()` 的显式入参优先于环境变量，便于测试构造不同参数的实例。
 
 ## 凭据轮换与失效规则
 
@@ -81,6 +135,11 @@ curl -s localhost:8000/resources/doc-2 -H "X-Session-Token: $TOKEN"
 # 轮换后旧凭据 -> 401 credential_rotated
 curl -s -X POST localhost:8000/sessions/rotate \
   -H 'Content-Type: application/json' -d "{\"token\":\"$TOKEN\"}"
+# 查看审计（可按 subject/outcome/时间范围筛选、offset/limit 分页）
+curl -s 'localhost:8000/ops/audit?subject=alice&limit=10' | jq
+# 查看运行状态（锁定情况、有效会话数、审计占用）
+curl -s 'localhost:8000/ops/status?source=127.0.0.1' | jq
+# 用响应头中的 X-Trace-Id 反查本次请求对应的审计记录
 ```
 
 ## 测试覆盖
@@ -92,3 +151,11 @@ curl -s -X POST localhost:8000/sessions/rotate \
   来源隔离。
 - `tests/test_api.py`：端到端凭据生命周期、越权/不存在响应形态、
   12 路并发轮换、限流锁定与恢复。
+- `tests/test_tracing.py`：成功/凭据拒绝/授权拒绝/限流/未预期异常下的追踪标识
+  一致性、调用方传入标识的沿用、追踪标识与审计记录的关联。
+- `tests/test_audit.py`：审计写入与结果序列、筛选与分页、容量淘汰不影响会话与
+  限流状态、16 路并发写入计数精确、单元级 FIFO 淘汰顺序。
+- `tests/test_ops.py`：状态端点（锁定与恢复时刻、有效会话数、审计占用、不暴露
+  凭据）、环境变量覆盖与默认值兼容。
+
+测试运行时通过 `-s` 与 `log_cli` 输出各用例的业务场景、判定依据与结果日志。

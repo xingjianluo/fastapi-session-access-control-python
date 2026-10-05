@@ -23,6 +23,9 @@ class RejectionReason(str, enum.Enum):
     # 限流相关
     RATE_LIMITED = "rate_limited"  # 来源被临时锁定/节流
 
+    # 未预期异常（统一兜底，不暴露内部细节）
+    INTERNAL_ERROR = "internal_error"
+
 
 class AccessDeniedError(Exception):
     """授权链路统一异常，携带可区分原因与 HTTP 状态码。"""

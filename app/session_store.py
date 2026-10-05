@@ -89,3 +89,13 @@ class SessionStore:
             session = self._by_token.get(token)
             if session is not None:
                 session.revoked = True
+
+    def active_count(self, now: float | None = None) -> int:
+        """当前有效会话数（未撤销、未轮换、未过期）。只读统计，不暴露凭据。"""
+        now = time.time() if now is None else now
+        with self._lock:
+            return sum(
+                1
+                for s in self._by_id.values()
+                if not s.revoked and s.rotated_to is None and not s.is_expired(now)
+            )
