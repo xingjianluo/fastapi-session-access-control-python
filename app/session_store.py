@@ -83,6 +83,15 @@ class SessionStore:
             self._by_token[new_session.token] = new_session
             return new_session
 
+    def active_count(self) -> int:
+        """当前有效会话数（未撤销、未轮换、未过期）。只读，不暴露凭据。"""
+        now = time.time()
+        with self._lock:
+            return sum(
+                1 for s in self._by_id.values()
+                if not s.revoked and s.rotated_to is None and not s.is_expired(now)
+            )
+
     def revoke(self, token: str) -> None:
         """撤销凭据。未知凭据视为幂等成功（不泄露存在性之外的语义差异由 validate 区分）。"""
         with self._lock:

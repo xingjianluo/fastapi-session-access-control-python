@@ -55,6 +55,10 @@ class Authorizer:
             matched_owner=matched_owner,
         )
 
+    def get_resource(self, resource_id: str) -> Resource:
+        """按 id 取资源；调用方需先通过 decide/authorize 判定。"""
+        return self._resources[resource_id]
+
     def authorize(self, session: Session, resource_id: str) -> Resource:
         """判定失败时抛出 AccessDeniedError；成功返回资源。"""
         decision = self.decide(session, resource_id)
